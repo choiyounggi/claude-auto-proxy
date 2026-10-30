@@ -103,7 +103,7 @@ export function updateFormula(text, version, sha256) {
 }
 
 function git(...args) {
-  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
+  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 }
 
 function lastTag() {
