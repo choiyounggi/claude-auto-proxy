@@ -1,0 +1,33 @@
+{
+  "name": "claude-auto-proxy",
+  "version": "0.1.0",
+  "description": "Route every Claude Code connection on macOS through an HTTP or SOCKS5 proxy, toggled on and off without restarting sessions",
+  "type": "module",
+  "bin": {
+    "claude-auto-proxy": "bin/claude-auto-proxy.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "os": [
+    "darwin"
+  ],
+  "engines": {
+    "node": ">=20.11"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/choiyounggi/claude-auto-proxy.git"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "proxy",
+    "socks5",
+    "macos"
+  ]
+}
