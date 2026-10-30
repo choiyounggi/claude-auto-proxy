@@ -1,0 +1,112 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm test
+
+  # Cuts a release for every push to main that changes something installable:
+  # bumps package.json from the conventional commits since the last tag, tags it,
+  # publishes a GitHub release, then points the Homebrew formula at the new tag.
+  # Commits pushed here with GITHUB_TOKEN do not trigger another run.
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Plan
+        id: plan
+        run: |
+          plan="$(node scripts/release.mjs plan)"
+          echo "$plan"
+          release="$(node -p "JSON.parse(process.argv[1]).release" "$plan")"
+          version="$(node -p "JSON.parse(process.argv[1]).version" "$plan")"
+          if [ "$release" = "true" ] && git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+            echo "v$version already exists; nothing to do"
+            release=false
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Tag
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          node scripts/release.mjs set-version "$VERSION"
+          if ! git diff --quiet -- package.json; then
+            git add package.json
+            git commit -m "chore(release): v$VERSION"
+          fi
+          git tag -a "v$VERSION" -m "v$VERSION"
+          git push origin HEAD:main
+          git push origin "v$VERSION"
+
+      - name: GitHub release
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: gh release create "v$VERSION" --title "v$VERSION" --notes-file release-notes.md --verify-tag
+
+      - name: Homebrew formula
+        if: steps.plan.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${VERSION}.tar.gz"
+          # The archive can take a moment to become downloadable after the tag push.
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fsSL "$url" -o release.tar.gz; then break; fi
+            [ "$attempt" = 6 ] && { echo "archive never became available: $url"; exit 1; }
+            sleep 10
+          done
+          sha="$(sha256sum release.tar.gz | cut -d' ' -f1)"
+          rm release.tar.gz
+          node scripts/release.mjs formula "$VERSION" "$sha"
+          if git diff --quiet -- Formula/claude-auto-proxy.rb; then
+            echo "formula already points at v$VERSION"
+            exit 0
+          fi
+          git add Formula/claude-auto-proxy.rb
+          git commit -m "chore(release): update Homebrew formula for v$VERSION"
+          git push origin HEAD:main
+
+      - name: npm publish
+        if: steps.plan.outputs.release == 'true' && env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

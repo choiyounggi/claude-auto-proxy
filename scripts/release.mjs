@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// Release planning for the GitHub Actions release job. The workflow owns git, tags
+// and uploads; this file owns the decisions, so they can be unit tested.
+//
+//   node scripts/release.mjs plan                    → JSON {release, version, previous, bump}, notes in release-notes.md
+//   node scripts/release.mjs set-version <version>   → writes package.json
+//   node scripts/release.mjs formula <version> <sha> → points the Homebrew formula at the tag
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const PACKAGE_JSON = path.join(ROOT, "package.json");
+const FORMULA = path.join(ROOT, "Formula", "claude-auto-proxy.rb");
+const NOTES = path.join(ROOT, "release-notes.md");
+const REPO_URL = "https://github.com/choiyounggi/claude-auto-proxy";
+
+// Commits of these types change nothing a user installs, so on their own they do
+// not cut a release. Anything else — including messages that follow no convention —
+// does, as a patch.
+const NON_RELEASING = new Set(["docs", "chore", "ci", "test", "style"]);
+const RELEASE_COMMIT = /^chore\(release\)/;
+const CONVENTIONAL = /^(\w+)(?:\([^)]*\))?(!)?:\s*(.*)$/;
+const RANK = { none: 0, patch: 1, minor: 2, major: 3 };
+
+export function parseVersion(version) {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(version).trim());
+  if (!match) throw new Error(`not a release version: ${version}`);
+  return match.slice(1).map(Number);
+}
+
+export function compareVersions(a, b) {
+  const [x, y] = [parseVersion(a), parseVersion(b)];
+  for (let i = 0; i < 3; i += 1) if (x[i] !== y[i]) return x[i] - y[i];
+  return 0;
+}
+
+export function classifyCommit({ subject, body = "" }) {
+  const match = CONVENTIONAL.exec(subject);
+  const type = match ? match[1].toLowerCase() : null;
+  if (match?.[2] || /^BREAKING[ -]CHANGE:/m.test(body)) return { type, bump: "major", title: match ? match[3] : subject };
+  if (type === "feat") return { type, bump: "minor", title: match[3] };
+  if (type && NON_RELEASING.has(type)) return { type, bump: "none", title: match[3] };
+  return { type, bump: "patch", title: match ? match[3] : subject };
+}
+
+export function bumpVersion(version, bump) {
+  const [major, minor, patch] = parseVersion(version);
+  if (bump === "major") return `${major + 1}.0.0`;
+  if (bump === "minor") return `${major}.${minor + 1}.0`;
+  if (bump === "patch") return `${major}.${minor}.${patch + 1}`;
+  throw new Error(`unknown bump: ${bump}`);
+}
+
+/**
+ * Decides the next release from the last tag, the commits since it and the version
+ * in package.json. With no tag yet, package.json's version is the first release.
+ * A version raised by hand in package.json wins over a smaller computed one.
+ */
+export function planRelease({ previousTag, packageVersion, commits }) {
+  const relevant = commits.filter((commit) => !RELEASE_COMMIT.test(commit.subject));
+  const classified = relevant.map((commit) => ({ ...commit, ...classifyCommit(commit) }));
+
+  if (previousTag === null) {
+    return { release: true, version: packageVersion, previous: null, bump: "initial", commits: classified };
+  }
+
+  const bump = classified.reduce((best, commit) => (RANK[commit.bump] > RANK[best] ? commit.bump : best), "none");
+  const previous = previousTag.replace(/^v/, "");
+  if (bump === "none") return { release: false, version: previous, previous, bump, commits: classified };
+
+  const computed = bumpVersion(previous, bump);
+  const version = compareVersions(packageVersion, computed) > 0 ? packageVersion : computed;
+  return { release: true, version, previous, bump, commits: classified };
+}
+
+export function renderNotes({ version, previous, commits }) {
+  const groups = [
+    ["Breaking changes", (c) => c.bump === "major"],
+    ["Features", (c) => c.bump === "minor"],
+    ["Fixes and other changes", (c) => c.bump === "patch"]
+  ];
+  const lines = [];
+  for (const [heading, belongs] of groups) {
+    const items = commits.filter(belongs);
+    if (items.length === 0) continue;
+    lines.push(`## ${heading}`, "", ...items.map((c) => `- ${c.title} (${c.hash.slice(0, 7)})`), "");
+  }
+  if (lines.length === 0) lines.push("Initial release.", "");
+  const range = previous ? `v${previous}...v${version}` : `v${version}`;
+  lines.push(`**Full changelog**: ${REPO_URL}/${previous ? "compare" : "commits"}/${range}`, "");
+  return lines.join("\n");
+}
+
+export function updateFormula(text, version, sha256) {
+  if (!/^[0-9a-f]{64}$/.test(sha256)) throw new Error(`not a sha256: ${sha256}`);
+  parseVersion(version);
+  const urlPattern = /(url "https:\/\/github\.com\/[^"]+\/archive\/refs\/tags\/)v[^"]+(\.tar\.gz")/;
+  const shaPattern = /(sha256 ")[0-9a-f]{64}(")/;
+  if (!urlPattern.test(text) || !shaPattern.test(text)) throw new Error("formula has no url/sha256 line to update");
+  return text.replace(urlPattern, `$1v${version}$2`).replace(shaPattern, `$1${sha256}$2`);
+}
+
+function git(...args) {
+  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
+}
+
+function lastTag() {
+  try {
+    return git("describe", "--tags", "--abbrev=0", "--match", "v[0-9]*");
+  } catch {
+    return null;
+  }
+}
+
+function commitsSince(tag) {
+  const range = tag ? [`${tag}..HEAD`] : ["HEAD"];
+  const raw = git("log", "--format=%H%x1f%s%x1f%b%x1e", ...range);
+  return raw
+    .split("\x1e")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const [hash, subject, body] = entry.split("\x1f");
+      return { hash, subject, body: body ?? "" };
+    });
+}
+
+function readPackage() {
+  return JSON.parse(fs.readFileSync(PACKAGE_JSON, "utf8"));
+}
+
+function main([command, ...args]) {
+  if (command === "plan") {
+    const previousTag = lastTag();
+    const plan = planRelease({ previousTag, packageVersion: readPackage().version, commits: commitsSince(previousTag) });
+    if (plan.release) fs.writeFileSync(NOTES, renderNotes(plan));
+    process.stdout.write(`${JSON.stringify({ release: plan.release, version: plan.version, previous: plan.previous, bump: plan.bump })}\n`);
+    return;
+  }
+  if (command === "set-version") {
+    parseVersion(args[0]);
+    const pkg = readPackage();
+    pkg.version = args[0];
+    fs.writeFileSync(PACKAGE_JSON, `${JSON.stringify(pkg, null, 2)}\n`);
+    return;
+  }
+  if (command === "formula") {
+    fs.writeFileSync(FORMULA, updateFormula(fs.readFileSync(FORMULA, "utf8"), args[0], args[1]));
+    return;
+  }
+  throw new Error(`usage: release.mjs plan | set-version <version> | formula <version> <sha256>`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  try {
+    main(process.argv.slice(2));
+  } catch (error) {
+    process.stderr.write(`error: ${error.message}\n`);
+    process.exit(1);
+  }
+}

@@ -132,3 +132,18 @@ npm test
 ```
 
 의존성이 없습니다. 테스트는 가짜 HTTP·SOCKS5 프록시와 로컬 TLS 서버로 전체 경로를 확인하며 sudo가 필요 없습니다(릴레이 테스트에는 `openssl`이 필요합니다). 설계 근거는 [docs/DESIGN.md](docs/DESIGN.md)에 있습니다.
+
+## 릴리즈
+
+main에 푸시하면 CI(`.github/workflows/ci.yml`)가 테스트를 통과한 뒤 자동으로 릴리즈합니다.
+
+1. 마지막 태그 이후 커밋 메시지(Conventional Commits)로 버전을 정합니다.
+   - `feat!:`나 본문의 `BREAKING CHANGE:` → major
+   - `feat:` → minor
+   - 그 밖의 커밋(규칙을 따르지 않는 메시지 포함) → patch
+   - `docs:`·`chore:`·`ci:`·`test:`·`style:`만 있으면 릴리즈하지 않습니다.
+2. `package.json` 버전을 올려 커밋하고 `vX.Y.Z` 태그를 붙여 GitHub Release를 만듭니다.
+3. 태그 압축 파일의 sha256으로 `Formula/claude-auto-proxy.rb`를 갱신해 커밋합니다. `brew upgrade`가 새 버전을 받습니다.
+4. 저장소 시크릿 `NPM_TOKEN`이 있으면 npm에도 배포합니다.
+
+버전을 직접 올리고 싶으면 `package.json`의 버전을 더 큰 값으로 바꿔 푸시하세요. 계산된 값보다 크면 그 값이 쓰입니다. 릴리즈 커밋은 `github-actions[bot]`이 main에 직접 푸시하므로, main에 브랜치 보호를 걸면 이 단계가 실패합니다.
