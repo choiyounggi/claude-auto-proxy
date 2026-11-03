@@ -27,7 +27,9 @@ import {
   claudeConfigDirs,
   claudeLogin,
   conflicts,
+  fetchRouterStatus,
   fileMode,
+  formatAccounts,
   keychainLookup,
   loadRouter,
   localOverrides,
@@ -368,7 +370,8 @@ async function readStdinLine() {
 const PING_FAILURES = {
   unreachable: "unreachable — wrong address, router not running, or not on the same tailnet",
   bad_key: "the router answered but refused the key",
-  not_router: "something answered, but it is not a claude-proxy-router"
+  not_router: "something answered, but it is not a claude-proxy-router",
+  no_status: "this claude-proxy-router has no /_router/status yet; update it on the router Mac"
 };
 
 async function checkRouter(url, key) {
@@ -527,6 +530,19 @@ async function cmdRouterStatus() {
   }
   out(`mode:    ${routed + stale > 0 ? `on (${routed + stale} settings files)` : "off"}`);
   const ping = await checkRouter(router.url, router.key);
+  if (ping.ok) {
+    // Claude Code's own /status and /usage cannot show these: its only credential is the router key.
+    const view = await fetchRouterStatus(router.url, router.key);
+    out("");
+    if (view.ok) {
+      out("accounts (from the router):");
+      // Reset times are judged on the router's clock, as the router itself does.
+      const routerNow = Date.parse(view.generatedAt ?? "");
+      for (const line of formatAccounts(view.accounts, Number.isFinite(routerNow) ? routerNow : Date.now(), { limitPct: view.limitPct ?? 100 })) {
+        out(line);
+      }
+    } else out(`accounts: not available — ${PING_FAILURES[view.reason]}`);
+  }
   if (stale > 0) {
     out("");
     out("Some settings still point at an older router address or key. Run `claude-auto-proxy router on` to update them.");

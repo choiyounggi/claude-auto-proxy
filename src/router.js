@@ -89,6 +89,94 @@ export async function pingRouter(url, key, { timeoutMs = 5000, fetchImpl = fetch
 }
 
 /**
+ * The router's per-account view (`GET /_router/status`, PROTOCOL.md "Status", the same
+ * endpoint `claude-proxy-router status` reads). Returns {ok, reason, accounts, limitPct,
+ * generatedAt}; reason is "unreachable" | "bad_key" | "no_status" (a router older than
+ * the endpoint answers 404) | "not_router" | null.
+ */
+export async function fetchRouterStatus(url, key, { timeoutMs = 5000, fetchImpl = fetch } = {}) {
+  const fail = (reason) => ({ ok: false, reason, accounts: null, limitPct: null, generatedAt: null });
+  let res;
+  try {
+    res = await fetchImpl(`${url}/_router/status`, {
+      headers: { "x-router-key": key },
+      signal: AbortSignal.timeout(timeoutMs),
+      redirect: "manual"
+    });
+  } catch {
+    return fail("unreachable");
+  }
+  let body = null;
+  try {
+    body = await res.json();
+  } catch (error) {
+    // A body cut off by the timeout is the network, not a foreign server.
+    if (error?.name === "TimeoutError" || error?.name === "AbortError") return fail("unreachable");
+  }
+  const fromRouter = body?.service === "claude-proxy-router";
+  if (res.status === 401 && fromRouter) return fail("bad_key");
+  if (res.status === 404) return fail("no_status");
+  if (res.status === 200 && fromRouter && Array.isArray(body.accounts)) {
+    return {
+      ok: true,
+      reason: null,
+      accounts: body.accounts,
+      limitPct: typeof body.limitPct === "number" ? body.limitPct : null,
+      generatedAt: typeof body.generatedAt === "string" ? body.generatedAt : null
+    };
+  }
+  return fail("not_router");
+}
+
+/** Router-supplied text without control characters, so a label cannot drive the terminal. */
+const clean = (value) => String(value).replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+
+/** A window's utilization in percent, 0 once its reset time has passed (the router counts it 0 too), or null. */
+function windowPct(window, nowMs) {
+  if (!window || typeof window.utilization !== "number") return null;
+  if (typeof window.resetsAt === "number" && window.resetsAt <= nowMs) return 0;
+  return window.utilization;
+}
+
+/**
+ * One line per router account: accounts the router would pick now first, each group by the
+ * router's score (unknown last). 5-hour, weekly and Fable use, then ok | ok (not for Fable)
+ * | full | limited until … | token …, plus a failed or stopped token refresh. The router's
+ * own `available`/`availableForFable` decide; a router without them falls back to the same
+ * rule with `limitPct`. `nowMs` should be the router's clock (generatedAt).
+ */
+export function formatAccounts(accounts, nowMs = Date.now(), { limitPct = 100 } = {}) {
+  const list = Array.isArray(accounts) ? accounts.filter((a) => a && typeof a === "object") : [];
+  if (list.length === 0) return ["  (no accounts)"];
+  const rows = list.map((a) => {
+    const score = typeof a.score === "number" ? a.score : null;
+    const usable = typeof a.available === "boolean" ? a.available
+      : !a.limitedUntil && a.token === "ok" && !(score !== null && score >= limitPct);
+    let state;
+    if (usable) state = a.availableForFable === false ? "ok (not for Fable)" : "ok";
+    else if (a.limitedUntil) state = `limited until ${clean(a.limitedUntil)}`;
+    else if (a.token !== "ok") state = `token ${clean(a.token ?? "unknown")}`;
+    else state = a.availableForFable === true ? "full (Fable only)" : "full";
+    const refresh = a.refresh?.state;
+    if (refresh === "failed" || refresh === "stopped") state += ` · token refresh ${refresh}`;
+    return {
+      label: clean(a.label ?? a.id ?? "?"),
+      usable,
+      score,
+      five: windowPct(a.fiveHour, nowMs),
+      seven: windowPct(a.sevenDay, nowMs),
+      fable: windowPct(a.fable, nowMs),
+      state
+    };
+  });
+  rows.sort((x, y) => (y.usable - x.usable) || (x.score === null) - (y.score === null) || (x.score ?? 0) - (y.score ?? 0)
+    || x.label.localeCompare(y.label));
+  const width = Math.max(...rows.map((r) => r.label.length));
+  const pct = (v) => (v === null ? "-" : `${Math.floor(v)}%`).padStart(4);
+  return rows.map((r) => `  ${r.label.padEnd(width)}  5h ${pct(r.five)}  7d ${pct(r.seven)}  fable ${pct(r.fable)}  ${r.state}`);
+}
+
+/**
  * Claude Code config directories on this Mac: $CLAUDE_CONFIG_DIR, ~/.claude, and every
  * Orca profile (each runs Claude Code with its own CLAUDE_CONFIG_DIR, so each has its
  * own settings.json). Existing directories only.

@@ -8,6 +8,8 @@ import {
   claudeConfigDirs,
   claudeLogin,
   ENV_KEY,
+  fetchRouterStatus,
+  formatAccounts,
   KEYCHAIN_SERVICE,
   keychainServiceFor,
   ENV_URL,
@@ -27,8 +29,17 @@ const KEY = "cpr_test-router-key-0123456789";
 const KEY2 = "cpr_rotated-router-key-9876543210";
 const BIN = path.resolve(import.meta.dirname, "..", "bin", "claude-auto-proxy.js");
 
+// Obviously fake accounts in the shape of claude-proxy-router's /_router/status.
+const HOUR = 3_600_000;
+const FAKE_ACCOUNTS = () => [
+  { id: "a", label: "acct-busy", token: "ok", score: 70, fiveHour: { utilization: 70.6, resetsAt: Date.now() + HOUR },
+    sevenDay: { utilization: 40, resetsAt: Date.now() + 24 * HOUR }, fable: null, limitedUntil: null },
+  { id: "b", label: "acct-idle", token: "ok", score: 12, fiveHour: { utilization: 12, resetsAt: Date.now() + HOUR },
+    sevenDay: { utilization: 3, resetsAt: Date.now() + 24 * HOUR }, fable: { utilization: 1, resetsAt: Date.now() + 24 * HOUR }, limitedUntil: null }
+];
+
 /** Answers like claude-proxy-router's /_router/ping (PROTOCOL.md v1). */
-async function startFakeRouter({ protocol = 1, key = KEY } = {}) {
+async function startFakeRouter({ protocol = 1, key = KEY, status = "ok", generatedAt = null } = {}) {
   const server = http.createServer((req, res) => {
     const json = (status, body) => {
       res.writeHead(status, { "content-type": "application/json" });
@@ -38,6 +49,11 @@ async function startFakeRouter({ protocol = 1, key = KEY } = {}) {
       json(401, { type: "error", error: { type: "authentication_error" }, service: "claude-proxy-router" });
     } else if (req.url === "/_router/ping") {
       json(200, { pong: true, service: "claude-proxy-router", protocol, version: "0.1.0", accounts: 2 });
+    } else if (req.url === "/_router/status" && status === "ok") {
+      json(200, { service: "claude-proxy-router", protocol, version: "0.1.0", limitPct: 100,
+        generatedAt: generatedAt ?? new Date().toISOString(), accounts: FAKE_ACCOUNTS() });
+    } else if (req.url === "/_router/status" && status === "no-accounts") {
+      json(200, { service: "claude-proxy-router", protocol, version: "0.1.0" });
     } else json(404, {});
   });
   const port = await listen(server);
@@ -324,6 +340,106 @@ describe("claude.ai login left in a config directory", () => {
   });
 });
 
+describe("router accounts", () => {
+  const now = Date.parse("2026-11-03T06:00:00Z");
+  const win = (utilization, resetsAt) => ({ utilization, resetsAt });
+
+  it("lists accounts the router can use first, each group by router score with unknown last", () => {
+    const lines = formatAccounts([
+      { label: "full-one", token: "ok", score: 100, fiveHour: win(100, now + HOUR), sevenDay: win(65, now + HOUR), fable: null },
+      { label: "fresh", token: "ok", score: null, fiveHour: null, sevenDay: null, fable: null },
+      { label: "roomy", token: "ok", score: 41, fiveHour: win(41.9, now + HOUR), sevenDay: win(12, now + HOUR), fable: win(5, now + HOUR) }
+    ], now);
+    assert.deepEqual(lines, [
+      "  roomy     5h  41%  7d  12%  fable   5%  ok",
+      "  fresh     5h    -  7d    -  fable    -  ok",
+      "  full-one  5h 100%  7d  65%  fable    -  full"
+    ]);
+  });
+
+  it("shows a window whose reset has passed as 0%, and names limited and token problems", () => {
+    const lines = formatAccounts([
+      { label: "reset", token: "ok", score: 0, fiveHour: win(90, now - 1), sevenDay: win(0, now + HOUR), fable: null },
+      { label: "limited", token: "ok", score: 10, fiveHour: win(10, now + HOUR), sevenDay: null, fable: null, limitedUntil: "2026-11-03T07:00:00.000Z" },
+      { label: "expired", token: "expired", score: 20, fiveHour: win(20, now + HOUR), sevenDay: null, fable: null }
+    ], now);
+    assert.equal(lines[0], "  reset    5h   0%  7d   0%  fable    -  ok");
+    assert.match(lines[1], /^ {2}limited .* limited until 2026-11-03T07:00:00\.000Z$/);
+    assert.match(lines[2], /^ {2}expired .* token expired$/);
+  });
+
+  it("says so when there are no accounts, and skips entries that are not objects", () => {
+    assert.deepEqual(formatAccounts([], now), ["  (no accounts)"]);
+    assert.deepEqual(formatAccounts(undefined, now), ["  (no accounts)"]);
+    assert.deepEqual(formatAccounts([null, 7], now), ["  (no accounts)"]);
+    assert.equal(formatAccounts([null, { label: "x", token: "ok", score: 1 }], now).length, 1);
+  });
+
+  it("follows the router's own available / availableForFable decision over the score", () => {
+    const lines = formatAccounts([
+      { label: "out", token: "ok", score: 50, fiveHour: win(50, now + HOUR), available: false, availableForFable: false },
+      { label: "no-fable", token: "ok", score: 20, fiveHour: win(20, now + HOUR), fable: win(99, now + HOUR), available: true, availableForFable: false },
+      { label: "in", token: "ok", score: 99, fiveHour: win(99, now + HOUR), available: true, availableForFable: true }
+    ], now);
+    assert.deepEqual(lines.map((l) => l.trim().split(/\s+/)[0]), ["no-fable", "in", "out"]);
+    // Out for other models but still taken for Fable (its Fable window is unknown to the router).
+    assert.match(formatAccounts([{ label: "f", token: "ok", score: 95, available: false, availableForFable: true }], now)[0], / full \(Fable only\)$/);
+    // Control characters from the router never reach the terminal.
+    assert.equal(formatAccounts([{ label: "evil\u001b[2J", token: "ok", score: 1, available: true }], now)[0].includes("\u001b"), false);
+    assert.match(lines[0], / ok \(not for Fable\)$/);
+    assert.match(lines[1], / ok$/);
+    assert.match(lines[2], / full$/);
+  });
+
+  it("uses the router's limitPct when it does not send available, and flags a failed token refresh", () => {
+    const lines = formatAccounts([
+      { label: "over", token: "ok", score: 95, fiveHour: win(95, now + HOUR) },
+      { label: "under", token: "ok", score: 80, fiveHour: win(80, now + HOUR), refresh: { state: "failed" } }
+    ], now, { limitPct: 90 });
+    assert.match(lines[0], /^ {2}under .* ok · token refresh failed$/);
+    assert.match(lines[1], /^ {2}over .* full$/);
+  });
+
+  describe("fetchRouterStatus", () => {
+    let router;
+    let other;
+    before(async () => {
+      router = await startFakeRouter();
+      other = await startOtherServer();
+    });
+    after(async () => {
+      await close(router.server);
+      await close(other.server);
+    });
+
+    it("returns the router's accounts, limitPct and clock", async () => {
+      const result = await fetchRouterStatus(router.url, KEY);
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.accounts.map((a) => a.label), ["acct-busy", "acct-idle"]);
+      assert.equal(result.limitPct, 100);
+      assert.ok(Number.isFinite(Date.parse(result.generatedAt)));
+    });
+
+    it("tells an older router (404) and a status without accounts apart", async () => {
+      const old = await startFakeRouter({ status: "missing" });
+      const odd = await startFakeRouter({ status: "no-accounts" });
+      try {
+        assert.equal((await fetchRouterStatus(old.url, KEY)).reason, "no_status");
+        assert.equal((await fetchRouterStatus(odd.url, KEY)).reason, "not_router");
+      } finally {
+        await close(old.server);
+        await close(odd.server);
+      }
+    });
+
+    it("tells a refused key, a non-router and an unreachable address apart", async () => {
+      assert.equal((await fetchRouterStatus(router.url, "cpr_wrong")).reason, "bad_key");
+      assert.equal((await fetchRouterStatus(other.url, KEY)).reason, "not_router");
+      assert.equal((await fetchRouterStatus("http://127.0.0.1:1", KEY, { timeoutMs: 1000 })).reason, "unreachable");
+    });
+  });
+});
+
 describe("router CLI", () => {
   const homes = [];
   let router;
@@ -384,6 +500,7 @@ describe("router CLI", () => {
     const status = await cli(home, ["router", "status"]);
     assert.equal(status.status, 0, status.stderr);
     assert.match(status.stdout, /mode: {4}on \(1 settings files\)/);
+    assert.match(status.stdout, /accounts \(from the router\):\n {2}acct-idle +5h {2}12% +7d {3}3% +fable {3}1% {2}ok\n {2}acct-busy +5h {2}70%/);
 
     const off = await cli(home, ["router", "off"]);
     assert.equal(off.status, 0, off.stderr);
@@ -447,6 +564,27 @@ describe("router CLI", () => {
     const on = await cli(home, ["router", "onboard", router.url, "--on"], `${KEY}\n`);
     assert.equal(on.status, 0, on.stderr);
     assert.doesNotMatch(on.stdout, /claude\.ai login is still saved|could not ask the Keychain/);
+  });
+
+  it("explains an older router without /_router/status and judges resets on the router's clock", async () => {
+    const old = await startFakeRouter({ status: "missing" });
+    // Two hours ahead: every fake 5-hour window (reset in 1 h) has already reset on the router's clock.
+    const ahead = await startFakeRouter({ generatedAt: new Date(Date.now() + 2 * HOUR).toISOString() });
+    try {
+      const homeOld = newHome({});
+      assert.equal((await cli(homeOld, ["router", "onboard", old.url, "--on"], `${KEY}\n`)).status, 0);
+      const statusOld = await cli(homeOld, ["router", "status"]);
+      assert.equal(statusOld.status, 0, statusOld.stderr);
+      assert.match(statusOld.stdout, /accounts: not available — this claude-proxy-router has no \/_router\/status yet/);
+
+      const homeAhead = newHome({});
+      assert.equal((await cli(homeAhead, ["router", "onboard", ahead.url, "--on"], `${KEY}\n`)).status, 0);
+      const statusAhead = await cli(homeAhead, ["router", "status"]);
+      assert.match(statusAhead.stdout, / {2}acct-busy +5h {3}0%/);
+    } finally {
+      await close(old.server);
+      await close(ahead.server);
+    }
   });
 
   it("keeps what to restore when a later settings file cannot be written", async () => {
