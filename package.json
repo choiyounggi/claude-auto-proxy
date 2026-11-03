@@ -1,6 +1,6 @@
 {
   "name": "claude-auto-proxy",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Route every Claude Code connection on macOS through an HTTP or SOCKS5 proxy, toggled on and off without restarting sessions",
   "type": "module",
   "bin": {
