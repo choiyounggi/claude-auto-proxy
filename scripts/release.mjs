@@ -21,6 +21,8 @@ const REPO_URL = "https://github.com/choiyounggi/claude-auto-proxy";
 // does, as a patch.
 const NON_RELEASING = new Set(["docs", "chore", "ci", "test", "style"]);
 const RELEASE_COMMIT = /^chore\(release\)/;
+// Git's own merge subjects: the merged commits are in the range and classified on their own.
+const MERGE_COMMIT = /^Merge (pull request|branch|remote-tracking branch|tag|commit) /;
 const CONVENTIONAL = /^(\w+)(?:\([^)]*\))?(!)?:\s*(.*)$/;
 const RANK = { none: 0, patch: 1, minor: 2, major: 3 };
 
@@ -37,6 +39,7 @@ export function compareVersions(a, b) {
 }
 
 export function classifyCommit({ subject, body = "" }) {
+  if (MERGE_COMMIT.test(subject)) return { type: "merge", bump: "none", title: subject };
   const match = CONVENTIONAL.exec(subject);
   const type = match ? match[1].toLowerCase() : null;
   if (match?.[2] || /^BREAKING[ -]CHANGE:/m.test(body)) return { type, bump: "major", title: match ? match[3] : subject };

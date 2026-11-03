@@ -29,6 +29,14 @@ describe("classifyCommit", () => {
   it("releases unconventional messages as a patch", () => {
     assert.deepEqual(classifyCommit(commit("Update stuff")), { type: null, bump: "patch", title: "Update stuff" });
   });
+
+  it("releases nothing for a merge commit, whatever it merges", () => {
+    assert.equal(classifyCommit(commit("Merge pull request #12 from someone/feature")).bump, "none");
+    assert.equal(classifyCommit(commit("Merge branch 'main' into topic")).bump, "none");
+    assert.equal(classifyCommit(commit("Merge remote-tracking branch 'origin/main'")).bump, "none");
+    // Only the merge itself is ignored: the merged commits are listed and classified on their own.
+    assert.equal(classifyCommit(commit("Merged the parser: faster")).bump, "patch");
+  });
 });
 
 describe("versions", () => {
@@ -66,6 +74,12 @@ describe("planRelease", () => {
 
   it("skips when only non-releasing commits landed", () => {
     const plan = planRelease({ previousTag: "v0.2.0", packageVersion: "0.2.0", commits: [commit("docs: a"), commit("ci: b")] });
+    assert.equal(plan.release, false);
+  });
+
+  it("skips a range of merge commits around non-releasing work", () => {
+    const plan = planRelease({ previousTag: "v0.2.0", packageVersion: "0.2.0",
+      commits: [commit("Merge pull request #3 from choiyounggi/ci"), commit("ci: b"), commit("Merge branch 'main' of github.com:x/y")] });
     assert.equal(plan.release, false);
   });
 

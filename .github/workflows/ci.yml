@@ -47,6 +47,8 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
+      # Each part (tag, GitHub release, npm, Homebrew formula) is checked on its own, so re-running a
+      # release that failed half-way finishes the missing parts instead of reporting success.
       - name: Plan
         id: plan
         run: |
@@ -54,15 +56,30 @@ jobs:
           echo "$plan"
           release="$(node -p "JSON.parse(process.argv[1]).release" "$plan")"
           version="$(node -p "JSON.parse(process.argv[1]).version" "$plan")"
-          if [ "$release" = "true" ] && git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
-            echo "v$version already exists; nothing to do"
-            release=false
+          tagged=false; github=false; npm_has=false; formula=false
+          if [ "$release" = "true" ]; then
+            git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null && tagged=true
+            gh release view "v$version" >/dev/null 2>&1 && github=true
+            npm view "claude-auto-proxy@$version" version >/dev/null 2>&1 && npm_has=true
+            git fetch -q origin main
+            git show origin/main:Formula/claude-auto-proxy.rb | grep -q "refs/tags/v$version.tar.gz" && formula=true
+            echo "v$version: tag=$tagged github-release=$github npm=$npm_has formula=$formula"
+            if [ "$tagged" = true ] && [ "$github" = true ] && [ "$npm_has" = true ] && [ "$formula" = true ]; then
+              echo "v$version is fully released; nothing to do"
+              release=false
+            fi
           fi
-          echo "release=$release" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "release=$release"
+            echo "version=$version"
+            echo "tagged=$tagged"
+            echo "github=$github"
+            echo "npm=$npm_has"
+            echo "formula=$formula"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Tag
-        if: steps.plan.outputs.release == 'true'
+        if: steps.plan.outputs.release == 'true' && steps.plan.outputs.tagged != 'true'
         env:
           VERSION: ${{ steps.plan.outputs.version }}
         run: |
@@ -78,16 +95,35 @@ jobs:
           git push origin "v$VERSION"
 
       - name: GitHub release
-        if: steps.plan.outputs.release == 'true'
+        if: steps.plan.outputs.release == 'true' && steps.plan.outputs.github != 'true'
         env:
           VERSION: ${{ steps.plan.outputs.version }}
         run: gh release create "v$VERSION" --title "v$VERSION" --notes-file release-notes.md --verify-tag
 
-      - name: Homebrew formula
-        if: steps.plan.outputs.release == 'true'
+      # Trusted publishing (npm package settings: GitHub Actions, choiyounggi/claude-auto-proxy, ci.yml)
+      # needs npm 11.5.1 or later; Node 22's bundled npm is older. Runs before the formula so a
+      # formula failure never holds back npm.
+      - name: npm publish
+        if: steps.plan.outputs.release == 'true' && steps.plan.outputs.npm != 'true'
         env:
           VERSION: ${{ steps.plan.outputs.version }}
         run: |
+          # On a re-run the checkout predates the release commit: set the version again.
+          node scripts/release.mjs set-version "$VERSION"
+          npm install -g npm@^11.5.1
+          npm publish --access public
+          git checkout -- package.json
+
+      - name: Homebrew formula
+        if: steps.plan.outputs.release == 'true' && steps.plan.outputs.formula != 'true'
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Start from main as it is now (it holds the release commit, also on a re-run).
+          git fetch -q origin main
+          git checkout -q -B formula-update origin/main
           url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/v${VERSION}.tar.gz"
           # The archive can take a moment to become downloadable after the tag push.
           for attempt in 1 2 3 4 5 6; do
@@ -105,11 +141,3 @@ jobs:
           git add Formula/claude-auto-proxy.rb
           git commit -m "chore(release): update Homebrew formula for v$VERSION"
           git push origin HEAD:main
-
-      # Trusted publishing (npm package settings: GitHub Actions, choiyounggi/claude-auto-proxy, ci.yml)
-      # needs npm 11.5.1 or later; Node 22's bundled npm is older.
-      - name: npm publish
-        if: steps.plan.outputs.release == 'true'
-        run: |
-          npm install -g npm@^11.5.1
-          npm publish --access public

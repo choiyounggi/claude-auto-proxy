@@ -169,9 +169,10 @@ main에 푸시하면 CI(`.github/workflows/ci.yml`)가 테스트를 통과한 �
    - `feat!:`나 본문의 `BREAKING CHANGE:` → major
    - `feat:` → minor
    - 그 밖의 커밋(규칙을 따르지 않는 메시지 포함) → patch
-   - `docs:`·`chore:`·`ci:`·`test:`·`style:`만 있으면 릴리즈하지 않습니다.
+   - `docs:`·`chore:`·`ci:`·`test:`·`style:`과 Git의 머지 커밋(`Merge pull request …`, `Merge branch …`)만 있으면 릴리즈하지 않습니다.
 2. `package.json` 버전을 올려 커밋하고 `vX.Y.Z` 태그를 붙여 GitHub Release를 만듭니다.
-3. 태그 압축 파일의 sha256으로 `Formula/claude-auto-proxy.rb`를 갱신해 커밋합니다. `brew upgrade`가 새 버전을 받습니다.
-4. npm에도 배포합니다. 토큰 없이 npm의 trusted publishing(GitHub Actions OIDC)으로 인증하므로, npm의 패키지 설정에 이 저장소의 `ci.yml`이 신뢰할 게시자로 등록돼 있어야 합니다(`npm trust github claude-auto-proxy --file ci.yml --repo choiyounggi/claude-auto-proxy --allow-publish`).
+3. npm에 배포합니다. 토큰 없이 npm의 trusted publishing(GitHub Actions OIDC)으로 인증하므로, npm의 패키지 설정에 이 저장소의 `ci.yml`이 신뢰할 게시자로 등록돼 있어야 합니다(`npm trust github claude-auto-proxy --file ci.yml --repo choiyounggi/claude-auto-proxy --allow-publish`).
+4. 태그 압축 파일의 sha256으로 `Formula/claude-auto-proxy.rb`를 갱신해 커밋합니다. `brew upgrade`가 새 버전을 받습니다.
+5. 태그·GitHub Release·npm·formula 중 하나가 실패하면 그 job을 다시 실행하세요. 이미 끝난 것은 건너뛰고 빠진 단계만 실행합니다.
 
 버전을 직접 올리고 싶으면 `package.json`의 버전을 더 큰 값으로 바꿔 푸시하세요. 계산된 값보다 크면 그 값이 쓰입니다. 릴리즈 커밋은 `github-actions[bot]`이 main에 직접 푸시하므로, main에 브랜치 보호를 걸면 이 단계가 실패합니다.
