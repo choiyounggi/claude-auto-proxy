@@ -12,7 +12,7 @@ class ClaudeAutoProxy < Formula
     # No npm dependencies: the package is plain ES modules run by Homebrew's node.
     libexec.install "package.json", "bin", "src"
     (bin/"claude-auto-proxy").write_env_script libexec/"bin/claude-auto-proxy.js",
-                                               PATH: "#{Formula["node"].opt_bin}:$PATH"
+                                               PATH: "#{formula_opt_bin("node")}:$PATH"
   end
 
   def caveats
