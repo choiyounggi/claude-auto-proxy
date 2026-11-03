@@ -108,8 +108,43 @@ describe("renderNotes", () => {
     const plan = planRelease({ previousTag: "v0.1.0", packageVersion: "0.1.0", commits: [commit("feat: onboarding"), commit("fix: leak")] });
     const notes = renderNotes(plan);
     assert.match(notes, /## Features\n\n- onboarding \(abcdef1\)/);
-    assert.match(notes, /## Fixes and other changes\n\n- leak/);
+    assert.match(notes, /## Fixes\n\n- leak/);
     assert.match(notes, /compare\/v0\.1\.0\.\.\.v0\.2\.0/);
+  });
+
+  it("lists every commit since the last tag by kind, leaving out release and merge commits", () => {
+    const commits = [
+      commit("feat!: drop node 20", "", "a00000000"),
+      commit("feat: onboarding", "", "b00000000"),
+      commit("fix(relay): close sockets", "", "c00000000"),
+      commit("refactor: split cli", "", "d00000000"),
+      commit("Update stuff", "", "e00000000"),
+      commit("docs: README", "", "f00000000"),
+      commit("ci: publish with trusted publishing", "", "100000000"),
+      commit("chore(release): update Homebrew formula for v0.1.0", "", "200000000"),
+      commit("Merge pull request #3 from someone/topic", "", "300000000"),
+      commit("test: more cases", "", "400000000")
+    ];
+    const notes = renderNotes(planRelease({ previousTag: "v0.1.0", packageVersion: "0.1.0", commits }));
+    assert.deepEqual([...notes.matchAll(/^## (.+)$/gm)].map((m) => m[1]),
+      ["Breaking changes", "Features", "Fixes", "Other changes", "Documentation", "Maintenance"]);
+    assert.match(notes, /## Other changes\n\n- split cli \(d000000\)\n- Update stuff \(e000000\)\n/);
+    assert.match(notes, /## Documentation\n\n- README \(f000000\)\n/);
+    assert.match(notes, /## Maintenance\n\n- publish with trusted publishing \(1000000\)\n- more cases \(4000000\)\n/);
+    assert.doesNotMatch(notes, /\(2000000\)|\(3000000\)|Merge pull request/);
+  });
+
+  it("leaves out only the bot's release commits, also when handed to renderNotes directly", () => {
+    const listed = [
+      commit("chore(release): v0.4.2", "", "500000000"),
+      commit("chore(release): update Homebrew formula for v0.4.2", "", "600000000"),
+      commit("chore(release): switch to trusted publishing (#16)", "", "700000000")
+    ].map((c) => ({ ...c, ...classifyCommit(c) }));
+    const notes = renderNotes({ version: "0.4.2", previous: "0.4.1", commits: listed });
+    assert.match(notes, /## Maintenance\n\n- switch to trusted publishing \(#16\) \(7000000\)\n/);
+    assert.doesNotMatch(notes, /\(5000000\)|\(6000000\)/);
+    // planRelease agrees: a human chore(release) commit stays in the range.
+    assert.equal(planRelease({ previousTag: "v0.4.1", packageVersion: "0.4.1", commits: [commit("chore(release): switch to trusted publishing (#16)")] }).commits.length, 1);
   });
 
   it("says initial release when nothing is grouped", () => {

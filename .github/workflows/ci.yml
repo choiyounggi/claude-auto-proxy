@@ -91,8 +91,9 @@ jobs:
             git commit -m "chore(release): v$VERSION"
           fi
           git tag -a "v$VERSION" -m "v$VERSION"
-          git push origin HEAD:main
-          git push origin "v$VERSION"
+          # One atomic push: main and the tag land together or not at all, so a re-run never finds one
+          # without the other.
+          git push --atomic origin HEAD:main "v$VERSION"
 
       - name: GitHub release
         if: steps.plan.outputs.release == 'true' && steps.plan.outputs.github != 'true'
