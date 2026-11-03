@@ -50,7 +50,7 @@ brew install claude-auto-proxy
 ### npm
 
 ```bash
-npm install -g github:choiyounggi/claude-auto-proxy
+npm install -g claude-auto-proxy
 ```
 
 > nvm 같은 버전 관리자로 설치한 Node를 쓰면, 그 Node 버전을 지웠을 때 데몬도 멈춥니다. Node를 바꾼 뒤에는 `claude-auto-proxy install`을 다시 실행하세요. Homebrew로 설치하면 이 문제가 없습니다.
@@ -172,6 +172,6 @@ main에 푸시하면 CI(`.github/workflows/ci.yml`)가 테스트를 통과한 �
    - `docs:`·`chore:`·`ci:`·`test:`·`style:`만 있으면 릴리즈하지 않습니다.
 2. `package.json` 버전을 올려 커밋하고 `vX.Y.Z` 태그를 붙여 GitHub Release를 만듭니다.
 3. 태그 압축 파일의 sha256으로 `Formula/claude-auto-proxy.rb`를 갱신해 커밋합니다. `brew upgrade`가 새 버전을 받습니다.
-4. 저장소 시크릿 `NPM_TOKEN`이 있으면 npm에도 배포합니다.
+4. npm에도 배포합니다. 토큰 없이 npm의 trusted publishing(GitHub Actions OIDC)으로 인증하므로, npm의 패키지 설정에 이 저장소의 `ci.yml`이 신뢰할 게시자로 등록돼 있어야 합니다(`npm trust github claude-auto-proxy --file ci.yml --repo choiyounggi/claude-auto-proxy --allow-publish`).
 
 버전을 직접 올리고 싶으면 `package.json`의 버전을 더 큰 값으로 바꿔 푸시하세요. 계산된 값보다 크면 그 값이 쓰입니다. 릴리즈 커밋은 `github-actions[bot]`이 main에 직접 푸시하므로, main에 브랜치 보호를 걸면 이 단계가 실패합니다.

@@ -478,6 +478,13 @@ describe("router CLI", () => {
   }
   const cli = (home, args, input, extraEnv) => run(process.execPath, [BIN, ...args], home, input, extraEnv);
 
+  it("describes what router status shows in --help", async () => {
+    const help = await cli(newHome(), ["--help"]);
+    assert.equal(help.status, 0, help.stderr);
+    assert.match(help.stdout, /router status +show the router, each account's usage and which settings use it/);
+    assert.match(help.stdout, /warns about a claude\.ai login left in a routed config directory/);
+  });
+
   it("does not register a router whose key is refused", async () => {
     const home = newHome({ model: "opus" });
     const result = await cli(home, ["router", "onboard", router.url, "--on"], "cpr_wrong\n");

@@ -71,7 +71,8 @@ Router mode (a claude-proxy-router answering plain HTTP, e.g. over Tailscale):
                                          (without a terminal, the key is read from stdin)
   claude-auto-proxy router on            point Claude Code's settings at the router
   claude-auto-proxy router off           restore Claude Code's settings
-  claude-auto-proxy router status        show the router, its health and which settings use it
+  claude-auto-proxy router status        show the router, each account's usage and which settings use it;
+                                         warns about a claude.ai login left in a routed config directory
 
 Commands that change the system ask for your password through sudo.
 Router commands only touch your own files and run without sudo.
