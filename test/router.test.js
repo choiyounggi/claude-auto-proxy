@@ -6,7 +6,10 @@ import path from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   claudeConfigDirs,
+  claudeLogin,
   ENV_KEY,
+  KEYCHAIN_SERVICE,
+  keychainServiceFor,
   ENV_URL,
   maskKey,
   parseRouterUrl,
@@ -226,6 +229,101 @@ describe("claudeConfigDirs", () => {
   });
 });
 
+describe("claude.ai login left in a config directory", () => {
+  const home = "/Users/u";
+  const profile = "/Users/u/Library/Application Support/orca/claude-profiles/p1/home";
+
+  it("names the Keychain item the way Claude Code does", () => {
+    assert.equal(keychainServiceFor(path.join(home, ".claude"), { home, env: {} }), KEYCHAIN_SERVICE);
+    // sha256 of the directory string, first 8 hex (computed independently with shasum -a 256).
+    assert.equal(keychainServiceFor(profile, { home, env: {} }), `${KEYCHAIN_SERVICE}-b4ac90b8`);
+    // $CLAUDE_CONFIG_DIR is hashed exactly as written, trailing slash included.
+    assert.equal(keychainServiceFor("/Users/u/custom-config", { home, env: { CLAUDE_CONFIG_DIR: "/Users/u/custom-config/" } }),
+      `${KEYCHAIN_SERVICE}-b5bb2f82`);
+    assert.equal(keychainServiceFor("/Users/u/custom-config", { home, env: {} }), `${KEYCHAIN_SERVICE}-3259defd`);
+  });
+
+  it("treats an empty CLAUDE_CONFIG_DIR as unset", () => {
+    assert.equal(keychainServiceFor(path.join(home, ".claude"), { home, env: { CLAUDE_CONFIG_DIR: "" } }), KEYCHAIN_SERVICE);
+  });
+
+  // Obviously fake stores: the shapes Claude Code writes, never real values.
+  const LOGIN_STORE = JSON.stringify({ claudeAiOauth: { accessToken: "fake-access" } });
+  const MCP_ONLY_STORE = JSON.stringify({ mcpOAuth: { "example|0": { accessToken: "fake-mcp" } } });
+  const ACCOUNT = JSON.stringify({ oauthAccount: { emailAddress: "someone@example.com" } });
+  function configDir() {
+    const root = scratchDir();
+    const dir = path.join(root, "profile-home");
+    fs.mkdirSync(dir);
+    return { root, dir };
+  }
+  const never = () => { throw new Error("the Keychain must not be asked"); };
+
+  it("reports a Keychain login when .claude.json names an account, asking only that directory's item", () => {
+    const { root, dir } = configDir();
+    try {
+      fs.writeFileSync(path.join(dir, ".claude.json"), ACCOUNT);
+      const asked = [];
+      const lookup = (service) => { asked.push(service); return 0; };
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup }), "keychain");
+      assert.deepEqual(asked, [keychainServiceFor(dir, { home: root, env: {} })]);
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup: () => 44 }), null);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not ask the Keychain when no account is named, so an MCP-only item is no login", () => {
+    const { root, dir } = configDir();
+    try {
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup: never }), null);
+      fs.writeFileSync(path.join(dir, ".credentials.json"), MCP_ONLY_STORE);
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup: never }), null);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a .credentials.json that holds a claude.ai login, and ignores a broken one", () => {
+    const { root, dir } = configDir();
+    try {
+      fs.writeFileSync(path.join(dir, ".credentials.json"), "{not json");
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup: never }), null);
+      fs.writeFileSync(path.join(dir, ".credentials.json"), LOGIN_STORE);
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup: never }), "file");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("says unchecked when the Keychain cannot be asked", () => {
+    const { root, dir } = configDir();
+    try {
+      fs.writeFileSync(path.join(dir, ".claude.json"), ACCOUNT);
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup: () => null }), "unchecked");
+      assert.equal(claudeLogin(dir, { home: root, env: {}, lookup: () => 36 }), "unchecked");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("checks both items for ~/.claude when CLAUDE_CONFIG_DIR points at it, reading ~/.claude.json", () => {
+    const root = scratchDir();
+    const dir = path.join(root, ".claude");
+    fs.mkdirSync(dir);
+    try {
+      fs.writeFileSync(path.join(root, ".claude.json"), ACCOUNT);
+      const asked = [];
+      const lookup = (service) => { asked.push(service); return service === KEYCHAIN_SERVICE ? 0 : 44; };
+      assert.equal(claudeLogin(dir, { home: root, env: { CLAUDE_CONFIG_DIR: dir }, lookup }), "keychain");
+      assert.deepEqual(asked, [keychainServiceFor(dir, { home: root, env: { CLAUDE_CONFIG_DIR: dir } }), KEYCHAIN_SERVICE]);
+      assert.notEqual(asked[0], KEYCHAIN_SERVICE);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("router CLI", () => {
   const homes = [];
   let router;
@@ -251,9 +349,9 @@ describe("router CLI", () => {
   const env = (home) => ({ PATH: process.env.PATH, HOME: home, CLAUDE_AUTO_PROXY_USER_HOME: path.join(home, "state") });
 
   // Spawned asynchronously: the fake router runs in this process and must keep answering.
-  function run(command, args, home, input = "") {
+  function run(command, args, home, input = "", extraEnv = {}) {
     return new Promise((resolve) => {
-      const child = spawn(command, args, { env: env(home) });
+      const child = spawn(command, args, { env: { ...env(home), ...extraEnv } });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d) => (stdout += d));
@@ -262,7 +360,7 @@ describe("router CLI", () => {
       child.stdin.end(input);
     });
   }
-  const cli = (home, args, input) => run(process.execPath, [BIN, ...args], home, input);
+  const cli = (home, args, input, extraEnv) => run(process.execPath, [BIN, ...args], home, input, extraEnv);
 
   it("does not register a router whose key is refused", async () => {
     const home = newHome({ model: "opus" });
@@ -293,6 +391,62 @@ describe("router CLI", () => {
     assert.equal(fs.statSync(path.join(home, ".claude", "settings.json")).mode & 0o777, 0o644);
 
     for (const output of [onboard, status, off]) assert.equal(`${output.stdout}${output.stderr}`.includes(KEY), false);
+  });
+
+  it("warns on and status about a config directory that still holds a claude.ai login", async () => {
+    const home = newHome({});
+    const profile = path.join(home, "Library/Application Support/orca/claude-profiles/p1");
+    fs.mkdirSync(path.join(profile, "home"), { recursive: true });
+    fs.writeFileSync(path.join(profile, "profile.json"), "{}");
+    fs.writeFileSync(path.join(profile, "home", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "fake-access" } }));
+
+    const on = await cli(home, ["router", "onboard", router.url, "--on"], `${KEY}\n`);
+    assert.equal(on.status, 0, on.stderr);
+    assert.match(on.stdout, /claude\.ai login is still saved/);
+    assert.ok(on.stdout.includes(`  ${path.join(profile, "home")}\n`), on.stdout);
+
+    const status = await cli(home, ["router", "status"]);
+    // The warning never changes the exit status: the router itself is healthy.
+    assert.equal(status.status, 0, status.stderr);
+    assert.match(status.stdout, /claude\.ai login is still saved/);
+    assert.ok(status.stdout.includes(`  ${path.join(profile, "home")}\n`), status.stdout);
+
+    const off = await cli(home, ["router", "off"]);
+    assert.equal(off.status, 0, off.stderr);
+    assert.doesNotMatch(off.stdout, /claude\.ai login/);
+  });
+
+  it("lists a directory once when CLAUDE_CONFIG_DIR is ~/.claude, and stays quiet for MCP-only stores", async () => {
+    const home = newHome({});
+    const dotClaude = path.join(home, ".claude");
+    const profile = path.join(home, "Library/Application Support/orca/claude-profiles/p1");
+    fs.mkdirSync(path.join(profile, "home"), { recursive: true });
+    fs.writeFileSync(path.join(profile, "profile.json"), "{}");
+    fs.writeFileSync(path.join(profile, "home", ".credentials.json"), JSON.stringify({ mcpOAuth: { "example|0": { accessToken: "fake-mcp" } } }));
+    fs.writeFileSync(path.join(dotClaude, ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "fake-access" } }));
+
+    const on = await cli(home, ["router", "onboard", router.url, "--on"], `${KEY}\n`, { CLAUDE_CONFIG_DIR: dotClaude });
+    assert.equal(on.status, 0, on.stderr);
+    assert.equal(on.stdout.split(`  ${dotClaude}\n`).length - 1, 1, on.stdout);
+    assert.equal(on.stdout.includes(path.join(profile, "home")), true); // listed as a routed settings file
+    assert.equal(on.stdout.includes(`  ${path.join(profile, "home")}\n`), false, on.stdout); // but not as a login
+
+    const status = await cli(home, ["router", "status"], "", { CLAUDE_CONFIG_DIR: dotClaude });
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(status.stdout.split(`  ${dotClaude}\n`).length - 1, 1, status.stdout);
+  });
+
+  it("asks the Keychain for a directory that names an account, and stays quiet when its item does not exist", async () => {
+    const home = newHome({});
+    const profile = path.join(home, "Library/Application Support/orca/claude-profiles/p1");
+    fs.mkdirSync(path.join(profile, "home"), { recursive: true });
+    fs.writeFileSync(path.join(profile, "profile.json"), "{}");
+    // An account is named, so the real `security` is asked for an item named after this unique scratch path: always 44.
+    fs.writeFileSync(path.join(profile, "home", ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "someone@example.com" } }));
+
+    const on = await cli(home, ["router", "onboard", router.url, "--on"], `${KEY}\n`);
+    assert.equal(on.status, 0, on.stderr);
+    assert.doesNotMatch(on.stdout, /claude\.ai login is still saved|could not ask the Keychain/);
   });
 
   it("keeps what to restore when a later settings file cannot be written", async () => {

@@ -25,8 +25,10 @@ import { normalizeProxyInput, redactProxyUrl } from "./proxy-url.js";
 import { log, startRelay } from "./relay.js";
 import {
   claudeConfigDirs,
+  claudeLogin,
   conflicts,
   fileMode,
+  keychainLookup,
   loadRouter,
   localOverrides,
   maskKey,
@@ -400,6 +402,37 @@ function readAllSettings() {
   return targets;
 }
 
+/** Warn about routed config directories that still keep a claude.ai login (see claudeLogin). */
+function warnLeftoverLogins(dirs) {
+  // A Keychain that hangs or refuses once is not asked again for the remaining directories.
+  let keychainBroken = false;
+  const lookup = (service) => {
+    if (keychainBroken) return null;
+    const status = keychainLookup(service);
+    if (status !== 0 && status !== 44) keychainBroken = true;
+    return status;
+  };
+  const found = [];
+  const unchecked = [];
+  for (const dir of new Set(dirs)) {
+    const login = claudeLogin(dir, { lookup });
+    if (login === "unchecked") unchecked.push(dir);
+    else if (login) found.push(dir);
+  }
+  if (found.length > 0) {
+    out("");
+    out("warning: a claude.ai login is still saved for these config directories. Claude Code sends some account");
+    out("requests (startup bootstrap, fast-mode check) to api.anthropic.com with that login, not through the router:");
+    for (const dir of found) out(`  ${dir}`);
+    out("To route every account request through the router, run /logout in a Claude Code session that uses each one.");
+  }
+  if (unchecked.length > 0) {
+    out("");
+    out("note: could not ask the Keychain whether these config directories still hold a claude.ai login:");
+    for (const dir of unchecked) out(`  ${dir}`);
+  }
+}
+
 async function cmdRouterOn({ skipPing = false } = {}) {
   const router = loadRouter();
   if (!router) throw new Error("no router registered yet — run: claude-auto-proxy router onboard");
@@ -426,6 +459,7 @@ async function cmdRouterOn({ skipPing = false } = {}) {
     out("warning: ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL is set in this shell; sessions started from it may not use the router.");
   }
   if (routingOn()) out("note: tunnel routing (/etc/hosts) is also on; API calls now go to the router instead.");
+  warnLeftoverLogins(claudeConfigDirs());
 }
 
 function cmdRouterOff() {
@@ -469,18 +503,24 @@ async function cmdRouterStatus() {
   out(`router:  ${router.url} (key ${maskKey(router.key)})`);
   let routed = 0;
   let stale = 0;
-  const files = new Set();
+  const files = new Map();
+  // Every directory whose settings use the router, including ones sharing a settings file.
+  const routedDirs = [];
   for (const dir of claudeConfigDirs()) {
     let state;
     let file = path.join(dir, "settings.json");
     try {
       file = resolveSettingsFile(dir);
-      if (files.has(file)) continue;
+      if (files.has(file)) {
+        if (files.get(file) === "on" || files.get(file) === "stale") routedDirs.push(dir);
+        continue;
+      }
       state = routeState(readSettings(file), router, router.restore[file]);
     } catch (error) {
       state = `unreadable — ${error.message}`;
     }
-    files.add(file);
+    files.set(file, state);
+    if (state === "on" || state === "stale") routedDirs.push(dir);
     if (state === "on") routed += 1;
     if (state === "stale") stale += 1;
     out(`  ${file}: ${state === "stale" ? "on, but with an older router address or key" : state}`);
@@ -496,6 +536,7 @@ async function cmdRouterStatus() {
     out("Router mode is on but the router does not answer, so new Claude Code sessions cannot connect.");
     out("Run `claude-auto-proxy router off` to connect directly.");
   }
+  warnLeftoverLogins(routedDirs);
   return stale > 0 || (routed > 0 && !ping.ok) ? 1 : 0;
 }
 

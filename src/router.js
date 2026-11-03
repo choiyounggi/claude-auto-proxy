@@ -3,6 +3,8 @@
 // ANTHROPIC_AUTH_TOKEN into the `env` of every Claude Code settings file on this Mac;
 // turning it off puts back whatever those two keys held before.
 // The router side's contract is PROTOCOL.md in claude-proxy-router.
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -256,6 +258,64 @@ export function conflicts(settings) {
   if (settings.env?.ANTHROPIC_API_KEY) found.push("env.ANTHROPIC_API_KEY");
   if (settings.apiKeyHelper) found.push("apiKeyHelper");
   return found;
+}
+
+export const KEYCHAIN_SERVICE = "Claude Code-credentials";
+const SECURITY_BIN = "/usr/bin/security";
+
+const sha8 = (text) => createHash("sha256").update(text, "utf8").digest("hex").slice(0, 8);
+
+/**
+ * The Keychain item holding a config directory's claude.ai login: the bare name for
+ * ~/.claude, otherwise the name plus the first 8 hex of sha256 of the directory string.
+ * $CLAUDE_CONFIG_DIR is hashed exactly as written — the same rule claude-proxy-router's
+ * keychainServiceFor uses to read these items.
+ */
+export function keychainServiceFor(dir, { home = os.homedir(), env = process.env } = {}) {
+  const raw = env.CLAUDE_CONFIG_DIR;
+  if (raw && path.resolve(raw) === dir) return `${KEYCHAIN_SERVICE}-${sha8(raw)}`;
+  if (dir === path.join(home, ".claude")) return KEYCHAIN_SERVICE;
+  return `${KEYCHAIN_SERVICE}-${sha8(dir)}`;
+}
+
+/** Exit status of `security find-generic-password -s <service>` (0 found, 44 not found), or null if it could not run. -w is never passed, so the secret is never read. */
+export function keychainLookup(service) {
+  const result = spawnSync(SECURITY_BIN, ["find-generic-password", "-s", service], { stdio: "ignore", timeout: 2000 });
+  return result.error ? null : result.status;
+}
+
+function readJsonFile(file, fsImpl) {
+  try {
+    return JSON.parse(fsImpl.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether a config directory still keeps a claude.ai login: "file" (.credentials.json,
+ * Claude Code's fallback store, holds `claudeAiOauth`), "keychain" (the directory's
+ * .claude.json names an `oauthAccount` and its Keychain item exists), "unchecked"
+ * (an account is named but the Keychain could not be asked) or null. The credential
+ * store can hold only MCP tokens, so an item existing is not enough on its own.
+ * With router mode on, Claude Code still sends a few account requests (startup
+ * bootstrap, fast-mode check) to api.anthropic.com with that login, not through the router.
+ */
+export function claudeLogin(dir, { home = os.homedir(), env = process.env, fsImpl = fs, lookup = keychainLookup } = {}) {
+  if (readJsonFile(path.join(dir, ".credentials.json"), fsImpl)?.claudeAiOauth) return "file";
+  const isDefault = dir === path.join(home, ".claude");
+  // ~/.claude keeps its .claude.json in the home directory unless CLAUDE_CONFIG_DIR points at it.
+  const accountFiles = isDefault ? [path.join(home, ".claude.json"), path.join(dir, ".claude.json")] : [path.join(dir, ".claude.json")];
+  if (!accountFiles.some((file) => readJsonFile(file, fsImpl)?.oauthAccount)) return null;
+  // With CLAUDE_CONFIG_DIR=~/.claude, sessions started with and without it use different items.
+  const services = [...new Set([keychainServiceFor(dir, { home, env }), ...(isDefault ? [KEYCHAIN_SERVICE] : [])])];
+  let unknown = false;
+  for (const service of services) {
+    const status = lookup(service);
+    if (status === 0) return "keychain";
+    if (status !== 44) unknown = true;
+  }
+  return unknown ? "unchecked" : null;
 }
 
 /** settings.local.json overrides settings.json, so router keys set there win over ours. */

@@ -59,6 +59,7 @@ claude-proxy-router는 CONNECT 터널을 받지 않고(평문 HTTP 서버, CONNE
 | 등록·켜기 전에 `/_router/ping` 핑퐁 | 키 오타나 꺼진 라우터로 바꾸면 새 세션이 연결하지 못한다. 실패 이유를 닿지 않음·키 거부·라우터 아님으로 나눈다(PROTOCOL.md v1) |
 | sudo 없이, sudo로 실행하면 거부 | 사용자 파일만 바꾼다. root로 돌면 HOME이 달라 엉뚱한 파일을 바꾼다 |
 | 바꾼 설정 파일은 0600 | 라우터 키가 들어간다 |
+| 남은 claude.ai 로그인은 경고만 하고 지우지 않음 | 로그인이 있으면 Claude Code가 bootstrap·fast mode 확인을 그 OAuth 토큰으로 `api.anthropic.com`에 직접 보낸다(로그인이 없으면 이 요청을 보내지 않음 — 2026-11-03 TLS 관찰 실측). 로그아웃은 `router off` 뒤의 직접 연결까지 바꾸므로 사용자가 정한다. 자격 증명 저장소에는 MCP 토큰(`mcpOAuth`)만 있을 수 있으므로 항목이 있다는 것만으로 로그인으로 보지 않는다: `.credentials.json`은 `claudeAiOauth`를, Keychain은 `.claude.json`의 `oauthAccount`가 있을 때만 `find-generic-password -s`의 종료 코드를 본다(`-w`는 쓰지 않음). 비밀값을 읽지 않는 대가로, `oauthAccount`가 남아 있고 Keychain 항목에 MCP 토큰만 있으면 오경고가 날 수 있다. `security`는 2초 상한, 한 번 실패하면 남은 폴더는 묻지 않는다 |
 
 ## 한계
 
