@@ -1,8 +1,8 @@
 class ClaudeAutoProxy < Formula
   desc "Route Claude Code traffic on macOS through an HTTP or SOCKS5 proxy"
   homepage "https://github.com/choiyounggi/claude-auto-proxy"
-  url "https://github.com/choiyounggi/claude-auto-proxy/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "1805d85c153ac6a25a1a306ce106da526aba6029c5216a1264747b94f061dfad"
+  url "https://github.com/choiyounggi/claude-auto-proxy/archive/refs/tags/v0.2.0.tar.gz"
+  sha256 "0720162f27eb67e524d5773952936f1f6ddb03d05d7cccb37f6dd7605a228aba"
   head "https://github.com/choiyounggi/claude-auto-proxy.git", branch: "main"
 
   depends_on :macos
