@@ -59,7 +59,7 @@ npm install -g github:choiyounggi/claude-auto-proxy
 
 ```
 $ claude-auto-proxy onboard
-Enter the proxy router address.
+Enter the proxy address (for a claude-proxy-router, use `claude-auto-proxy router onboard`).
 proxy: http://proxy.example.com:3128
 checking http://proxy.example.com:3128 → api.anthropic.com:443
   [1/3] reach the proxy                ok (12 ms)
@@ -100,6 +100,31 @@ Turn routing on now? [Y/n]
 - **Tailscale을 userspace 모드로 돌리면** 로컬에 SOCKS5 서버가 생깁니다. `tailscaled --tun=userspace-networking --socks5-server=localhost:1055`로 띄우고 `onboard socks5://localhost:1055`로 등록하세요.
 - **이 맥에서 도는 프록시는 루프를 조심해야 합니다.** 그 프록시가 이 맥의 `/etc/hosts`로 이름을 조회하면 127.0.0.1을 받아 릴레이로 되돌아옵니다. 이 경우 `on`이 hosts를 바꾼 뒤 확인하는 단계에서 실패를 감지하고 hosts를 되돌립니다. tailscaled가 이름을 어떻게 조회하는지는 확인하지 못했으니, 켠 뒤 `status`로 확인하세요.
 
+## 라우터 모드 (claude-proxy-router)
+
+[claude-proxy-router](https://github.com/choiyounggi/claude-proxy-router)는 다른 맥에서 도는 API 라우터입니다. 그 맥에 로그인된 Claude 계정 중 여유가 가장 많은 계정으로 요청을 대신 보냅니다. 라우터는 HTTP CONNECT 터널이 아니라 평문 HTTP로 API 요청 자체를 받기 때문에, 위의 프록시 방식(hosts + 릴레이)으로는 붙을 수 없습니다. 그래서 라우터 모드는 Claude Code가 부르는 **API 주소 자체를 바꿉니다.**
+
+```
+$ claude-auto-proxy router onboard
+Enter the router address and key (on the router Mac: claude-proxy-router key).
+router address (e.g. http://100.64.0.10:18787): http://100.81.176.24:18787
+router key:                                   ← 입력한 키는 화면에 표시되지 않습니다
+  ping http://100.81.176.24:18787  ok (25 ms, 6 accounts available, router 0.1.0)
+registered: http://100.81.176.24:18787 (key cpr_***xY)
+Point Claude Code at the router now? [Y/n]
+```
+
+- **등록 전 핑퐁**: 라우터의 `/_router/ping`에 키를 붙여 묻습니다. `pong`과 프로토콜 1이 돌아와야만 등록합니다. 실패하면 이유를 셋으로 나눠 보여 줍니다. 닿지 않음(주소·tailnet 문제), 키 거부, 라우터가 아님입니다.
+- **`router on`**: Claude Code 설정 파일의 `env`에 `ANTHROPIC_BASE_URL`(라우터 주소)과 `ANTHROPIC_AUTH_TOKEN`(라우터 키)을 넣습니다. 대상 설정 파일은 `~/.claude/settings.json`, Orca 프로필마다 있는 `settings.json`, 그리고 `$CLAUDE_CONFIG_DIR`의 `settings.json`입니다. 켜기 전에 핑으로 다시 확인하고, 라우터가 답하지 않으면 아무것도 바꾸지 않습니다.
+- **`router off`**: 두 키를 켜기 전 값으로 되돌립니다. 그사이 손으로 주소를 바꾼 파일은 주소는 두고 라우터 키만 원래 값으로 되돌린 뒤 알려 줍니다. 되돌릴 값은 파일을 바꾸기 *전에* 저장하므로, 중간에 쓰기가 실패해도 `router off`로 원래대로 돌아갑니다.
+- `settings.json`이 심볼릭 링크(dotfiles 등)면 링크는 그대로 두고 원본 파일을 바꿉니다.
+- **sudo가 필요 없습니다.** 사용자 파일만 바꿉니다. 거꾸로 sudo로 실행하면 거부합니다(root의 설정 파일을 바꾸게 되기 때문).
+- **새 세션부터 적용됩니다.** 실행 중인 세션이 설정 파일의 `env` 변경을 바로 반영하는지는 보장하지 않으니 다시 시작하세요. 실행 중인 세션까지 바꾸는 프록시 방식과 다른 점입니다.
+- 라우터 키가 설정 파일에 들어가므로, 켜 있는 동안 설정 파일은 소유자만 읽을 수 있게(0600) 두고 `router off` 때 원래 권한으로 되돌립니다. 같은 파일의 `env.ANTHROPIC_API_KEY`·`apiKeyHelper`, 옆의 `settings.local.json`, 셸의 `ANTHROPIC_API_KEY`·`ANTHROPIC_BASE_URL`처럼 라우터 설정을 덮을 수 있는 값이 있으면 경고합니다.
+- `settings.json`의 `env`는 Claude Code가 실행하는 명령에도 환경변수로 전달되므로, 세션 안에서 `env`를 실행하면 라우터 키가 화면에 나옵니다.
+- `router on` 뒤에 Orca 프로필을 새로 만들었으면 `router on`을 한 번 더 실행하세요. `router status`가 파일별 적용 여부를 보여 주고, 예전 라우터 주소·키가 남은 파일이 있으면 알려 줍니다.
+- `uninstall`은 라우터 모드를 끄지 않습니다. 필요하면 `router off`를 먼저 실행하세요.
+
 ## 켰을 때 알아 둘 점
 
 - **실행 중인 세션은 조금 늦게 바뀝니다.** 이미 열려 있는 연결은 끊길 때까지 그대로 쓰이고, 새로 맺는 연결부터 프록시를 탑니다. 보통 수십 초 안에 바뀝니다.
@@ -124,6 +149,7 @@ Turn routing on now? [Y/n]
 | `/Library/LaunchDaemons/io.github.choiyounggi.claude-auto-proxy.plist` | 데몬 정의 |
 | `/Library/Logs/claude-auto-proxy.log` | 데몬 로그 (프록시 인증정보는 기록하지 않음) |
 | `/etc/hosts` | 표시된 관리 블록만 넣고 뺍니다. 바꾸기 직전 상태는 `/etc/hosts.claude-auto-proxy.bak`에 남깁니다 |
+| `~/Library/Application Support/claude-auto-proxy/router.json` | 라우터 모드: 라우터 주소·키와, `router off`가 되돌릴 이전 값 (0600) |
 
 ## 개발
 

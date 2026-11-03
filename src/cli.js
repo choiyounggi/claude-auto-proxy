@@ -3,6 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import readline from "node:readline/promises";
+import { Writable } from "node:stream";
 import { checkTunnel, probeProxy } from "./check.js";
 import { configDir, daemonIds, DAEMON_USER, DEFAULT_HOSTS, loadConfig, normalizeHost, saveConfig } from "./config.js";
 import { applyBlock, blockHosts, flushDns, hasBlock, readHosts, stripBlock, writeHosts } from "./hosts.js";
@@ -22,6 +23,24 @@ import {
 } from "./launchd.js";
 import { normalizeProxyInput, redactProxyUrl } from "./proxy-url.js";
 import { log, startRelay } from "./relay.js";
+import {
+  claudeConfigDirs,
+  conflicts,
+  fileMode,
+  loadRouter,
+  localOverrides,
+  maskKey,
+  parseRouterUrl,
+  pingRouter,
+  readSettings,
+  resolveSettingsFile,
+  routeSettings,
+  routeState,
+  saveRouter,
+  unrouteSettings,
+  validRouterKey,
+  writeSettings
+} from "./router.js";
 
 const SOURCE_ROOT = path.resolve(import.meta.dirname, "..");
 const VERSION = JSON.parse(fs.readFileSync(path.join(SOURCE_ROOT, "package.json"), "utf8")).version;
@@ -42,7 +61,16 @@ Usage:
   claude-auto-proxy install              (re)install the daemon, e.g. after changing Node versions
   claude-auto-proxy uninstall [--purge]  remove the daemon (and with --purge, the config)
 
+Router mode (a claude-proxy-router answering plain HTTP, e.g. over Tailscale):
+  claude-auto-proxy router onboard [url] [--on]
+                                         ping-pong the router with its key, register it
+                                         (without a terminal, the key is read from stdin)
+  claude-auto-proxy router on            point Claude Code's settings at the router
+  claude-auto-proxy router off           restore Claude Code's settings
+  claude-auto-proxy router status        show the router, its health and which settings use it
+
 Commands that change the system ask for your password through sudo.
+Router commands only touch your own files and run without sudo.
 `;
 
 class UsageError extends Error {}
@@ -265,7 +293,7 @@ async function cmdOnboard(args) {
   let input = positional[0];
   if (input === undefined) {
     if (!interactive) throw new UsageError("onboard needs a url when not run in a terminal");
-    out("Enter the proxy router address.");
+    out("Enter the proxy address (for a claude-proxy-router, use `claude-auto-proxy router onboard`).");
     out("  examples: http://proxy.example.com:3128  socks5://127.0.0.1:1055  100.64.0.10:3128");
     input = await ask("proxy: ");
   }
@@ -309,6 +337,224 @@ function cmdUninstall(args) {
   fs.rmSync(APP_DIR, { recursive: true, force: true });
   if (purge) fs.rmSync(configDir(), { recursive: true, force: true });
   out(`uninstalled${purge ? " (config removed)" : ` (config kept in ${configDir()})`}`);
+}
+
+// Typed keys are not echoed, so the router key stays out of the terminal scrollback:
+// readline echoes into a stream that discards everything, while it keeps the
+// terminal in raw mode so the terminal itself does not echo either.
+async function askSecret(question) {
+  process.stdout.write(question);
+  const discard = new Writable({ write: (_chunk, _encoding, done) => done() });
+  const prompt = readline.createInterface({ input: process.stdin, output: discard, terminal: true });
+  try {
+    return (await prompt.question("")).trim();
+  } finally {
+    prompt.close();
+    process.stdout.write("\n");
+  }
+}
+
+async function readStdinLine() {
+  let data = "";
+  for await (const chunk of process.stdin) {
+    data += chunk;
+    if (/\r?\n/.test(data)) break;
+  }
+  return data.split(/\r?\n/)[0].trim();
+}
+
+const PING_FAILURES = {
+  unreachable: "unreachable — wrong address, router not running, or not on the same tailnet",
+  bad_key: "the router answered but refused the key",
+  not_router: "something answered, but it is not a claude-proxy-router"
+};
+
+async function checkRouter(url, key) {
+  const ping = await pingRouter(url, key);
+  if (!ping.ok) {
+    out(`  ping ${url}  FAILED (${ping.ms} ms) — ${PING_FAILURES[ping.reason]}${ping.error ? ` [${ping.error}]` : ""}`);
+    return ping;
+  }
+  const accounts = Number.isInteger(ping.info.accounts) ? ping.info.accounts : "?";
+  out(`  ping ${url}  ok (${ping.ms} ms, ${accounts} accounts available, router ${ping.info.version ?? "?"})`);
+  if (ping.info.accounts === 0) out("  note: the router has no account that can take a request right now (all limited or logged out)");
+  return ping;
+}
+
+function requireUser() {
+  // Under sudo, HOME and the settings files would be root's, not the person's running Claude Code.
+  if (process.getuid() === 0) throw new Error("run router commands as yourself, without sudo");
+}
+
+/** Every settings file read up front: one unreadable file aborts before anything is written. */
+function readAllSettings() {
+  const dirs = claudeConfigDirs();
+  const seen = new Set();
+  const targets = [];
+  for (const dir of dirs) {
+    const file = resolveSettingsFile(dir);
+    if (seen.has(file)) continue;
+    seen.add(file);
+    targets.push({ dir, file, settings: readSettings(file), mode: fileMode(file) });
+  }
+  return targets;
+}
+
+async function cmdRouterOn({ skipPing = false } = {}) {
+  const router = loadRouter();
+  if (!router) throw new Error("no router registered yet — run: claude-auto-proxy router onboard");
+  // A dead router would leave every new Claude Code session unable to connect.
+  if (!skipPing && !(await checkRouter(router.url, router.key)).ok) throw new Error("the router did not answer, so nothing was changed");
+
+  const targets = readAllSettings();
+  if (targets.length === 0) throw new Error("no Claude Code config directory found (~/.claude does not exist)");
+  const restore = { ...router.restore };
+  for (const { dir, file, settings, mode } of targets) {
+    const next = routeSettings(settings, router, restore[file], mode);
+    // The restore entry is saved before the file changes: if this write (or a later
+    // one) fails, `off` still knows what to put back.
+    restore[file] = next.entry;
+    saveRouter({ url: router.url, key: router.key, restore });
+    if (next.changed) writeSettings(file, next.settings);
+    const clash = [...conflicts(next.settings), ...localOverrides(dir)];
+    out(`  ${file}: ${next.changed ? "routed" : "already routed"}${clash.length ? ` — warning: ${clash.join(", ")} may override the router` : ""}`);
+  }
+
+  out(`router on — Claude Code uses ${router.url} (key ${maskKey(router.key)})`);
+  out("New Claude Code sessions use the router; restart sessions that are already running.");
+  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_BASE_URL) {
+    out("warning: ANTHROPIC_API_KEY or ANTHROPIC_BASE_URL is set in this shell; sessions started from it may not use the router.");
+  }
+  if (routingOn()) out("note: tunnel routing (/etc/hosts) is also on; API calls now go to the router instead.");
+}
+
+function cmdRouterOff() {
+  requireUser();
+  const router = loadRouter();
+  const files = Object.keys(router?.restore ?? {});
+  if (!router || files.length === 0) {
+    out("router already off");
+    return;
+  }
+  const restore = { ...router.restore };
+  let failed = 0;
+  for (const file of files) {
+    const entry = restore[file];
+    try {
+      const next = unrouteSettings(readSettings(file), entry);
+      if (next.changed) writeSettings(file, next.settings, { mode: entry.mode ?? 0o600 });
+      if (next.foreign) {
+        out(`  ${file}: base url left alone — it was changed by hand since \`router on\`${next.changed ? " (router key removed)" : ""}`);
+      } else out(`  ${file}: ${next.changed ? "restored" : "not routed"}`);
+    } catch (error) {
+      // The entry stays, so a later `router off` can still restore this file.
+      failed += 1;
+      out(`  ${file}: skipped — ${error.message}`);
+      continue;
+    }
+    delete restore[file];
+    saveRouter({ url: router.url, key: router.key, restore });
+  }
+  if (failed > 0) throw new Error(`${failed} settings file(s) could not be restored; fix them and run \`router off\` again`);
+  out("router off — new Claude Code sessions connect as before; restart sessions that are already running.");
+}
+
+async function cmdRouterStatus() {
+  requireUser();
+  const router = loadRouter();
+  if (!router) {
+    out("router:  not registered (claude-auto-proxy router onboard)");
+    return 0;
+  }
+  out(`router:  ${router.url} (key ${maskKey(router.key)})`);
+  let routed = 0;
+  let stale = 0;
+  const files = new Set();
+  for (const dir of claudeConfigDirs()) {
+    let state;
+    let file = path.join(dir, "settings.json");
+    try {
+      file = resolveSettingsFile(dir);
+      if (files.has(file)) continue;
+      state = routeState(readSettings(file), router, router.restore[file]);
+    } catch (error) {
+      state = `unreadable — ${error.message}`;
+    }
+    files.add(file);
+    if (state === "on") routed += 1;
+    if (state === "stale") stale += 1;
+    out(`  ${file}: ${state === "stale" ? "on, but with an older router address or key" : state}`);
+  }
+  out(`mode:    ${routed + stale > 0 ? `on (${routed + stale} settings files)` : "off"}`);
+  const ping = await checkRouter(router.url, router.key);
+  if (stale > 0) {
+    out("");
+    out("Some settings still point at an older router address or key. Run `claude-auto-proxy router on` to update them.");
+  }
+  if (routed + stale > 0 && !ping.ok) {
+    out("");
+    out("Router mode is on but the router does not answer, so new Claude Code sessions cannot connect.");
+    out("Run `claude-auto-proxy router off` to connect directly.");
+  }
+  return stale > 0 || (routed > 0 && !ping.ok) ? 1 : 0;
+}
+
+async function cmdRouterOnboard(args) {
+  requireUser();
+  const turnOn = args.includes("--on");
+  const positional = args.filter((arg) => !arg.startsWith("--"));
+  if (positional.length > 1) throw new UsageError("router onboard takes at most one url");
+  const interactive = process.stdin.isTTY === true;
+
+  let input = positional[0];
+  if (input === undefined) {
+    if (!interactive) throw new UsageError("router onboard needs a url when not run in a terminal");
+    out("Enter the router address and key (on the router Mac: claude-proxy-router key).");
+    input = await ask("router address (e.g. http://100.64.0.10:18787): ");
+  }
+  const url = parseRouterUrl(input);
+  const key = interactive ? await askSecret("router key: ") : await readStdinLine();
+  if (key === "") throw new UsageError("the router key is empty");
+  if (!validRouterKey(key)) throw new UsageError("the router key has spaces or characters a router key never has");
+
+  const ping = await checkRouter(url, key);
+  if (!ping.ok) throw new Error("the router did not pass the ping, so it was not registered");
+
+  const previous = loadRouter();
+  const wasOn = Object.keys(previous?.restore ?? {}).length > 0;
+  saveRouter({ url, key, restore: previous?.restore ?? {} });
+  out(`registered: ${url} (key ${maskKey(key)})`);
+
+  if (wasOn) {
+    await cmdRouterOn({ skipPing: true });
+    return;
+  }
+  const answer = turnOn ? "y" : interactive ? await ask("Point Claude Code at the router now? [Y/n] ") : "n";
+  if (/^(y|yes|)$/i.test(answer)) await cmdRouterOn({ skipPing: true });
+  else out("registered only — run `claude-auto-proxy router on` when you want to use it");
+}
+
+async function cmdRouter(args) {
+  const [action, ...rest] = args;
+  switch (action) {
+    case "onboard":
+      await cmdRouterOnboard(rest);
+      return 0;
+    case "on":
+      requireUser();
+      if (rest.length) throw new UsageError("router on takes no arguments");
+      await cmdRouterOn();
+      return 0;
+    case "off":
+      if (rest.length) throw new UsageError("router off takes no arguments");
+      cmdRouterOff();
+      return 0;
+    case "status":
+      return await cmdRouterStatus();
+    default:
+      // Not echoed: a key pasted in the wrong place must not land in the terminal.
+      throw new UsageError("unknown router command (onboard, on, off or status)");
+  }
 }
 
 async function cmdDaemon(args) {
@@ -384,6 +630,8 @@ export async function main(argv) {
       case "uninstall":
         cmdUninstall(args);
         return 0;
+      case "router":
+        return await cmdRouter(args);
       case "daemon":
         await cmdDaemon(args);
         return null;
